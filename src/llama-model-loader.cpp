@@ -11,24 +11,108 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <map>
 #include <regex>
+#include <string>
+#include <vector>
+#include <cerrno>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// 415 MEMCHECK: parse "Key:   N kB" lines from /proc files, returns -1 if the line is not for this key
+static long memcheck_kb(const char * line, const char * key) {
+    const size_t n = strlen(key);
+    return strncmp(line, key, n) == 0 ? atol(line + n) : -1;
+}
+
+// 415 MEMCHECK: process-level memory snapshot.
+//  - VmRSS / VmHWM (peak RSS) from /proc/self/status
+//  - Anonymous, Private_Clean, Shared_Clean, Private_Dirty from /proc/self/smaps_rollup (Linux >= 4.14)
+// Anonymous ~ repack buffers / heap. *_Clean ~ file-backed mmap pages mapped into this process.
 static void log_rss(const char * label) {
-    FILE * f = fopen("/proc/self/status", "r");
-    if (!f) return;
-    long rss_kb = 0, vm_kb = 0;
-    char line[128];
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "VmRSS:", 6) == 0) sscanf(line, "VmRSS: %ld", &rss_kb);
-        if (strncmp(line, "VmSize:", 7) == 0) sscanf(line, "VmSize: %ld", &vm_kb);
+    long rss = 0, vm = 0, hwm = 0;
+    long anon = -1, priv_clean = -1, shr_clean = -1, priv_dirty = -1;
+    char line[256];
+
+    if (FILE * f = fopen("/proc/self/status", "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            long v;
+            if ((v = memcheck_kb(line, "VmRSS:"))  >= 0) rss = v;
+            if ((v = memcheck_kb(line, "VmSize:")) >= 0) vm  = v;
+            if ((v = memcheck_kb(line, "VmHWM:"))  >= 0) hwm = v;
+        }
+        fclose(f);
+    } else {
+        return;
     }
-    fclose(f);
-    LLAMA_LOG_INFO("[MEMCHECK @ %s] RSS=%.1f MB  Virt=%.1f MB\n",
-        label, rss_kb / 1024.0f, vm_kb / 1024.0f);
+
+    if (FILE * f = fopen("/proc/self/smaps_rollup", "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            long v;
+            if ((v = memcheck_kb(line, "Anonymous:"))     >= 0) anon       = v;
+            if ((v = memcheck_kb(line, "Private_Clean:")) >= 0) priv_clean = v;
+            if ((v = memcheck_kb(line, "Shared_Clean:"))  >= 0) shr_clean  = v;
+            if ((v = memcheck_kb(line, "Private_Dirty:")) >= 0) priv_dirty = v;
+        }
+        fclose(f);
+    }
+
+    LLAMA_LOG_INFO("[MEMCHECK @ %s] RSS=%.1f MB  Virt=%.1f MB  PeakRSS=%.1f MB  Anon=%.1f MB  PrivClean=%.1f MB  SharedClean=%.1f MB  PrivDirty=%.1f MB\n",
+        label, rss / 1024.0f, vm / 1024.0f, hwm / 1024.0f,
+        anon / 1024.0f, priv_clean / 1024.0f, shr_clean / 1024.0f, priv_dirty / 1024.0f);
+}
+
+// 415 MEMCHECK: how much of a file mapping is resident in the kernel page cache (mincore).
+// Separates "pages the kernel holds" from "pages this process has mapped" (RSS). Fails (n/a) if the
+// range has unmapped holes, e.g. after unmap_fragment().
+static void log_mmap_residency(const char * label, const void * addr, size_t size) {
+#ifdef __linux__
+    const size_t page    = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t n_pages = (size + page - 1) / page;
+    std::vector<unsigned char> vec(n_pages);
+    if (mincore(const_cast<void *>(addr), size, vec.data()) != 0) {
+        LLAMA_LOG_INFO("[MEMCHECK @ %s] mmap page-cache residency: n/a (%s)\n", label, strerror(errno));
+        return;
+    }
+    size_t resident = 0;
+    for (unsigned char v : vec) {
+        resident += v & 1;
+    }
+    LLAMA_LOG_INFO("[MEMCHECK @ %s] mmap page-cache residency: %.1f / %.1f MB\n",
+        label, resident * page / 1024.0 / 1024.0, size / 1024.0 / 1024.0);
+#else
+    (void) label; (void) addr; (void) size;
+#endif
+}
+
+// 415 EXPERIMENT: drop the pages fully covered by [first, last) of a read-only file mapping from this process.
+// MADV_DONTNEED on a PROT_READ file mapping only removes the page-table entries; a later access refaults the same
+// bytes from the page cache / disk, so this is safe even if another tensor aliases the range (e.g. tied embeddings).
+// Unlike munmap it never invalidates the address range. Returns bytes released (0 if nothing / not supported).
+static size_t memcheck_release_range(void * base, size_t first, size_t last) {
+#ifdef __linux__
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    first = (first + page - 1) & ~(page - 1); // round start up, end down: never touch a page shared with a neighbour
+    last  =  last              & ~(page - 1);
+    if (last <= first) {
+        return 0;
+    }
+    if (madvise((char *) base + first, last - first, MADV_DONTNEED) != 0) {
+        LLAMA_LOG_WARN("[MEMCHECK] madvise(MADV_DONTNEED) failed: %s\n", strerror(errno));
+        return 0;
+    }
+    return last - first;
+#else
+    (void) base; (void) first; (void) last;
+    return 0;
+#endif
 }
 
 const char * llama_file_version_name(llama_fver version) {
@@ -1547,6 +1631,24 @@ bool llama_model_loader::load_all_data(
     }
     size_t cumulative_loaded = 0;
     size_t next_log_threshold = 512 * 1024 * 1024;
+
+    // 415 MEMCHECK: bytes routed to each buffer type, plus progress through the mmap -> tensor_set (e.g. CPU_REPACK) path
+    std::map<std::string, size_t> bytes_by_buft;
+    size_t cumulative_set_from_mmap = 0;
+    size_t next_set_log_threshold   = 512 * 1024 * 1024;
+    auto log_all_residency = [&](const char * lbl) {
+        if (!use_mmap) { return; }
+        for (uint32_t i = 0; i < mappings.size(); i++) {
+            log_mmap_residency(lbl, mappings.at(i)->addr(), mappings.at(i)->size());
+        }
+    };
+    // 415 EXPERIMENT: LLAMA_MMAP_RELEASE=1 releases each source range right after it has been copied/repacked
+    const char * release_env = getenv("LLAMA_MMAP_RELEASE");
+    const bool   release_after_set = use_mmap && !lmlocks && release_env && atoi(release_env) != 0;
+    size_t       bytes_released = 0;
+    LLAMA_LOG_INFO("[MEMCHECK] LLAMA_MMAP_RELEASE=%s\n", release_after_set ? "on" : "off");
+    log_rss("load_all_data-start");
+    log_all_residency("load_all_data-start");
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         
         const auto * weight = get_weight(ggml_get_name(cur));
@@ -1596,7 +1698,24 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+                // 415 MEMCHECK: non-mmap-backed destination (CPU_REPACK, or a GPU buffer). The source stays
+                // mapped/resident in the mmap while the destination buffer grows.
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+
+                if (release_after_set) {
+                    bytes_released += memcheck_release_range(mapping->addr(), weight->offs, weight->offs + n_size);
+                }
+
+                cumulative_set_from_mmap += n_size;
+                if (cumulative_set_from_mmap >= next_set_log_threshold) {
+                    next_set_log_threshold += 512 * 1024 * 1024;
+                    char label[160];
+                    snprintf(label, sizeof(label), "mmap->%s %.0fMB tensor=%s",
+                        cur->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer)) : "?",
+                        cumulative_set_from_mmap / 1024.0f / 1024.0f, ggml_get_name(cur));
+                    log_rss(label);
+                    log_all_residency(label);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1691,8 +1810,22 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        // 415 MEMCHECK
+        if (cur->buffer) {
+            bytes_by_buft[ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer))] += n_size;
+        }
+
         size_done += n_size;
     }
+
+    // 415 MEMCHECK: per-buffer-type totals for this context. A CPU_REPACK line here is the upper bound on what
+    // per-tensor unmapping could release; tensors counted under the plain CPU buft stay in place in the mmap.
+    for (const auto & [name, bytes] : bytes_by_buft) {
+        LLAMA_LOG_INFO("[MEMCHECK] load summary: buft=%s tensor_bytes=%.1f MB\n", name.c_str(), bytes / 1024.0 / 1024.0);
+    }
+    LLAMA_LOG_INFO("[MEMCHECK] load summary: released_via_madvise=%.1f MB\n", bytes_released / 1024.0 / 1024.0);
+    log_rss("load_all_data-tensors-done");
+    log_all_residency("load_all_data-tensors-done");
 
     // free temporary resources used for async uploads
     for (auto * event : events) {
@@ -1727,8 +1860,10 @@ bool llama_model_loader::load_all_data(
         // unmap offloaded tensors and metadata
 
         if (use_mmap) {
+            log_rss("pre-final-unmap");
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
+                LLAMA_LOG_INFO("[MEMCHECK] mmaps_used[%u] = [%zu, %zu) of %zu bytes\n", idx, mmap_used.first, mmap_used.second, mappings.at(idx)->size());
                 auto & mapping = mappings.at(idx);
 
                 LLAMA_LOG_DEBUG("%s: offloading header + metadata + GPU tensor pages\n", __func__);
@@ -1738,6 +1873,7 @@ bool llama_model_loader::load_all_data(
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
             }
+            log_rss("post-final-unmap");
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor
