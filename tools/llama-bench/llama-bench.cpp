@@ -315,6 +315,9 @@ static std::vector<int> parse_int_range(const std::string & s) {
     return result;
 }
 
+// 415 EXPERIMENT: -nr/--no-repack disables the extra buffer types (CPU weight repacking). Process-wide, not a sweep parameter.
+static bool g_no_repack = false;
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -411,6 +414,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --numa <distribute|isolate|numactl>         numa mode (default: disabled)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
+    printf("  -nr, --no-repack                            disable CPU weight repacking (default: repacking enabled)\n");
     printf("  --delay <0...N> (seconds)                   delay between each test (default: %d)\n", cmd_params_defaults.delay);
     printf("  -o, --output <csv|json|jsonl|md|sql>        output format printed to stdout (default: %s)\n", output_format_str(cmd_params_defaults.output_format));
     printf("  -oe, --output-err <csv|json|jsonl|md|sql>   output format printed to stderr (default: %s)\n", output_format_str(cmd_params_defaults.output_format_stderr));
@@ -946,6 +950,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.prio = (enum ggml_sched_priority) std::stoi(argv[i]);
+            } else if (arg == "-nr" || arg == "--no-repack") {
+                g_no_repack = true;
             } else if (arg == "--delay") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1163,6 +1169,7 @@ struct cmd_params_instance {
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
+        mparams.use_extra_bufts = !g_no_repack;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
